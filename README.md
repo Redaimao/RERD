@@ -25,7 +25,7 @@ Please cite our paper if you find our work useful for your research:
 
 ### Overall Architecture for RERD
 <p align="center">
-<img src='imgs/RER.png' width="500px"/>
+<img src='imgs/RERD.png' width="500px"/>
 
 RERD is comprised of the two major components based on an intermediate-fusion pipeline: (1) a multi-head distillation encoder is proposed to enhance unimodal representations from unaligned multimodal sequences, where the distillation attention layers dynamically capture and extract the most expressive unimodal features and (2) a novel multimodal sinkhorn distance regularizer is introduced to aid the joint optimization in training. 
 
