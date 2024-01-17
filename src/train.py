@@ -100,113 +100,6 @@ def train_model(settings, hyp_params, train_loader, valid_loader, test_loader):
         else:
             model = model.cuda()
 
-    def train(model, optimizer, criterion, local_rank, reg_en=False):
-
-        epoch_loss = 0
-        model.train()
-        num_batches = hyp_params.n_train // hyp_params.batch_size
-        proc_loss, proc_size = 0, 0
-        start_time = time.time()
-
-        for i_batch, (batch_X, batch_Y, batch_META) in enumerate(train_loader):
-            sample_ind, text, audio, vision = batch_X
-            eval_attr = batch_Y.squeeze(-1)  # if num of labels is 1
-
-            model.zero_grad()
-            optimizer.zero_grad()
-
-            if hyp_params.use_cuda:
-                # with torch.cuda.device(0):
-                if hyp_params.ddp:
-                    text, audio, vision, eval_attr = text.cuda(local_rank), audio.cuda(local_rank), vision.cuda(
-                        local_rank), eval_attr.cuda(local_rank)
-                else:
-                    text, audio, vision, eval_attr = text.cuda(), audio.cuda(), vision.cuda(), eval_attr.cuda()
-
-            batch_size = text.size(0)
-
-            combined_loss = 0
-            preds, hiddens, h_list = model(text, audio, vision)
-
-            raw_loss = criterion(preds, eval_attr)
-
-            if reg_en:
-                # Sinkhorn Distances
-                # reg_term = torch.mul(h_list[-1], 0.1)
-                reg_term = h_list[-1]
-                combined_loss += hyp_params.reg_lambda * torch.mean(reg_term)
-            else:
-                combined_loss = raw_loss
-
-            combined_loss.backward()
-
-            torch.nn.utils.clip_grad_norm_(model.parameters(), hyp_params.clip)
-            optimizer.step()
-
-            proc_loss += raw_loss.item() * batch_size
-            proc_size += batch_size
-            epoch_loss += combined_loss.item() * batch_size
-            if i_batch % hyp_params.log_interval == 0 and i_batch > 0:
-                avg_loss = proc_loss / proc_size
-                elapsed_time = time.time() - start_time
-                print('Epoch {:2d} | Batch {:3d}/{:3d} | Time/Batch(ms) {:5.2f} | Train Loss {:5.4f}'.
-                      format(epoch, i_batch, num_batches, elapsed_time * 1000 / hyp_params.log_interval, avg_loss))
-                proc_loss, proc_size = 0, 0
-                start_time = time.time()
-
-            del text, audio, vision, eval_attr, preds, hiddens, h_list
-            gc.collect()
-            torch.cuda.empty_cache()
-
-        return epoch_loss / hyp_params.n_train
-
-    def evaluate(model, criterion, local_rank, test=False, train=False):
-        model.eval()
-        if train:
-            loader = train_loader
-        elif test:
-            loader = test_loader
-        else:
-            loader = valid_loader
-        total_loss = 0.0
-
-        results = []
-        truths = []
-        with torch.no_grad():
-            for i_batch, (batch_X, batch_Y, batch_META) in enumerate(loader):
-                sample_ind, text, audio, vision = batch_X
-                eval_attr = batch_Y.squeeze(dim=-1)  # if num of labels is 1
-
-                if hyp_params.use_cuda:
-                    if hyp_params.ddp:
-                        text, audio, vision, eval_attr = text.cuda(local_rank), audio.cuda(local_rank), vision.cuda(
-                            local_rank), eval_attr.cuda(local_rank)
-                    else:
-                        text, audio, vision, eval_attr = text.cuda(), audio.cuda(), vision.cuda(), eval_attr.cuda()
-
-                batch_size = text.size(0)
-                preds, last_h_proj, h_list = model(text, audio, vision)
-                total_loss += criterion(preds, eval_attr).item() * batch_size
-
-                # add reg on validation set to check loss change
-                if not test and (hyp_params.reg_en is True):
-                    reg_term = h_list[-1]
-                    total_loss += hyp_params.reg_lambda * torch.mean(reg_term)
-                # Collect the results into dictionary
-                results.append(preds)
-                truths.append(eval_attr)
-
-        avg_loss = total_loss / (hyp_params.n_test if test else hyp_params.n_valid)
-
-        results = torch.cat(results)
-        truths = torch.cat(truths)
-
-        del text, audio, vision, eval_attr, preds, last_h_proj, h_list, total_loss
-        gc.collect()
-        torch.cuda.empty_cache()
-
-        return avg_loss, results, truths
-
     best_valid = 1e8
     best_acc_or_f1 = -1.0
     train_loss_ls = val_loss_ls = test_loss_ls = []
@@ -225,11 +118,10 @@ def train_model(settings, hyp_params, train_loader, valid_loader, test_loader):
             print('size of the model is {}'.format(get_model_size(model)))  # trimodal: 6,738,827
 
         start = time.time()
-        train_loss = train(model, optimizer, criterion, local_rank, reg_en)
-        val_loss, _, _ = evaluate(model, criterion, local_rank,
-                                  test=False, train=False)
-        test_loss, _, _ = evaluate(model, criterion, local_rank,
-                                   test=True, train=False)
+        train_loss = train_epoch(epoch, hyp_params, train_loader, model, optimizer, criterion, local_rank, reg_en)
+
+        val_loss, _, _ = evaluate(hyp_params, model, criterion, local_rank, valid_loader, False)
+        test_loss, _, _ = evaluate(hyp_params, model, criterion, local_rank, test_loader, True)
 
         time2 = datetime.datetime.now()
         time_diff = (time2 - time1).seconds
@@ -248,21 +140,13 @@ def train_model(settings, hyp_params, train_loader, valid_loader, test_loader):
             val_loss_ls.append(val_loss)
             test_loss_ls.append(test_loss)
 
-            print("-" * 50)
-            print(
-                'Epoch {:2d} | Time {:5.4f} sec | Valid Loss {:5.4f} | Test Loss {:5.4f}'.format(epoch, duration,
-                                                                                                 val_loss,
-                                                                                                 test_loss))
-            print("-" * 50)
+            print(f'E{epoch:2d} | Time {duration:5.4f} sec | Valid {val_loss:5.4f} | Test {test_loss:5.4f}')
             # for each epoch test the best model on test set and save
             print(f'evaluating in epoch: {epoch}#####')
             # evaluating accuracy on training set, validation set and test set, respectively
-            _, train_results, train_truths = evaluate(model, criterion, local_rank,
-                                                      test=False, train=True)
-            _, val_results, val_truths = evaluate(model, criterion, local_rank,
-                                                  test=False, train=False)
-            _, results, truths = evaluate(model, criterion, local_rank, test=True,
-                                          train=False)
+            _, train_results, train_truths = evaluate(hyp_params, model, criterion, local_rank, train_loader, False)
+            _, val_results, val_truths = evaluate(hyp_params, model, criterion, local_rank, valid_loader, False)
+            _, results, truths = evaluate(hyp_params, model, criterion, local_rank, test_loader, True)
 
             if hyp_params.dataset in ["mosei_senti", "mosei"]:
                 if hyp_params.train_mode is 'regression':
@@ -333,8 +217,7 @@ def train_model(settings, hyp_params, train_loader, valid_loader, test_loader):
         torch.cuda.empty_cache()
 
     model = load_model(hyp_params, name=hyp_params.name)
-    _, results, truths = evaluate(model, criterion, local_rank, test=True,
-                                  train=False)
+    _, results, truths = evaluate(hyp_params, model, criterion, local_rank, test_loader, True)
 
     if hyp_params.dataset in ["mosei_senti", "mosei"]:
         eval_mosei_senti(results, truths, True)
@@ -343,3 +226,106 @@ def train_model(settings, hyp_params, train_loader, valid_loader, test_loader):
 
     sys.stdout.flush()
     input('[Finished! Press enter ...]')
+
+def train_epoch(epoch, hyp_params, train_loader, model, optimizer, criterion, local_rank, reg_en=False):
+
+    epoch_loss = 0
+    model.train()
+    num_batches = hyp_params.n_train // hyp_params.batch_size
+    proc_loss, proc_size = 0, 0
+    start_time = time.time()
+
+    for i_batch, (batch_X, batch_Y, batch_META) in enumerate(train_loader):
+        sample_ind, text, audio, vision = batch_X
+        eval_attr = batch_Y.squeeze(-1)  # if num of labels is 1
+
+        model.zero_grad()
+        optimizer.zero_grad()
+
+        if hyp_params.use_cuda:
+            # with torch.cuda.device(0):
+            if hyp_params.ddp:
+                text, audio, vision, eval_attr = text.cuda(local_rank), audio.cuda(local_rank), vision.cuda(
+                    local_rank), eval_attr.cuda(local_rank)
+            else:
+                text, audio, vision, eval_attr = text.cuda(), audio.cuda(), vision.cuda(), eval_attr.cuda()
+
+        batch_size = text.size(0)
+
+        combined_loss = 0
+        preds, hiddens, h_list = model(text, audio, vision)
+
+        raw_loss = criterion(preds, eval_attr)
+
+        if reg_en:
+            # Sinkhorn Distances
+            # reg_term = torch.mul(h_list[-1], 0.1)
+            reg_term = h_list[-1]
+            combined_loss += hyp_params.reg_lambda * torch.mean(reg_term)
+        else:
+            combined_loss = raw_loss
+
+        combined_loss.backward()
+
+        torch.nn.utils.clip_grad_norm_(model.parameters(), hyp_params.clip)
+        optimizer.step()
+
+        proc_loss += raw_loss.item() * batch_size
+        proc_size += batch_size
+        epoch_loss += combined_loss.item() * batch_size
+        if i_batch % hyp_params.log_interval == 0 and i_batch > 0:
+            avg_loss = proc_loss / proc_size
+            elapsed_time = time.time() - start_time
+            print('Epoch {:2d} | Batch {:3d}/{:3d} | Time/Batch(ms) {:5.2f} | Train Loss {:5.4f}'.
+                  format(epoch, i_batch, num_batches, elapsed_time * 1000 / hyp_params.log_interval, avg_loss))
+            proc_loss, proc_size = 0, 0
+            start_time = time.time()
+
+        del text, audio, vision, eval_attr, preds, hiddens, h_list
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    return epoch_loss / hyp_params.n_train
+
+def evaluate(hyp_params, model, criterion, local_rank, loader, is_test_data):
+    model.eval()
+    total_loss = 0.0
+    total_cnt = 0
+
+    results = []
+    truths = []
+    with torch.no_grad():
+        for i_batch, (batch_X, batch_Y, batch_META) in enumerate(loader):
+            sample_ind, text, audio, vision = batch_X
+            eval_attr = batch_Y.squeeze(dim=-1)  # if num of labels is 1
+
+            if hyp_params.use_cuda:
+                if hyp_params.ddp:
+                    text, audio, vision, eval_attr = text.cuda(local_rank), audio.cuda(local_rank), vision.cuda(
+                        local_rank), eval_attr.cuda(local_rank)
+                else:
+                    text, audio, vision, eval_attr = text.cuda(), audio.cuda(), vision.cuda(), eval_attr.cuda()
+
+            batch_size = text.size(0)
+            preds, last_h_proj, h_list = model(text, audio, vision)
+            total_loss += criterion(preds, eval_attr).item() * batch_size
+            total_cnt += batch_size
+
+            # add reg on validation set to check loss change
+            if not is_test_data and (hyp_params.reg_en is True):
+                reg_term = h_list[-1]
+                total_loss += hyp_params.reg_lambda * torch.mean(reg_term)
+            # Collect the results into dictionary
+            results.append(preds)
+            truths.append(eval_attr)
+
+    avg_loss = total_loss / total_cnt
+
+    results = torch.cat(results)
+    truths = torch.cat(truths)
+
+    del text, audio, vision, eval_attr, preds, last_h_proj, h_list, total_loss
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    return avg_loss, results, truths
