@@ -23,21 +23,22 @@ def get_data(args, dataset, split='train'):
     return data
 
 
-def save_load_name(args, name=''):
+def get_ckpt_file_name(args):
+    """ get checkpoint file name """
     if args.aligned:
-        name = name if len(name) > 0 else 'aligned_model'
-    elif not args.aligned:
-        name = name if len(name) > 0 else 'nonaligned_model'
+        name = 'aligned_model'
+    else:
+        name = 'nonaligned_model'
 
     return name + '_' + args.model
 
 
 def save_model(args, model, name=''):
-    name = save_load_name(args, name)
+    name = name or get_ckpt_file_name(args)
     torch.save(model, f'all_models/{name}.pt')
 
 
 def load_model(args, name=''):
-    name = save_load_name(args, name)
+    name = name or get_ckpt_file_name(args)
     model = torch.load(f'all_models/{name}.pt')
     return model
